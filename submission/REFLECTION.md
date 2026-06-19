@@ -1,9 +1,9 @@
-# Reflection — Day 17 (≤ 200 words)
+# Reflection — Day 17 (≤ 200 từ)
 
-1. **The flywheel.** `build_preference_pairs` — if prompt→chosen/rejected matching is off, you silently get wrong pairs. Detect via prompt cardinality checks and monitoring the pair-ratio post decontamination.
+1. **Flywheel.** Bước dễ hỏng nhất là `build_preference_pairs` — nếu logic ghép prompt→chosen/rejected sai, bạn lặng lẽ tạo cặp sai mà không có lỗi. Phát hiện bằng cách kiểm tra cardinality của prompt: mỗi prompt unique phải có đúng 1 ok và 1 error turn. Giám sát tỷ lệ raw pairs / clean pairs sau decontamination.
 
-2. **Decontamination.** Skipping it trains on eval prompts, inflating eval accuracy. The lie surfaces when production prompts underperform vs held-out benchmarks — classic train/eval contamination.
+2. **Decontamination.** Bỏ qua bước này đồng nghĩa với việc train trên chính prompt trong eval set, làm sai lệch độ chính xác eval. Hậu quả thể hiện khi prompt thật (không trong eval) cho kết quả kém hơn benchmark — contamination kinh điển.
 
-3. **Point-in-time.** In fraud detection, joining a user's total transaction count *as of today* into a past transaction's feature leaks future data. Without `ASOF`, the model learns patterns unavailable at inference.
+3. **Point-in-time.** Trong phát hiện gian lận, join tổng số giao dịch của user *tính đến hôm nay* vào feature của giao dịch quá khứ làm rò rỉ dữ liệu tương lai. Không có `ASOF`, model học pattern không tồn tại tại thời điểm inference.
 
-4. **Graph vs vector.** KG answers "Which warehouse ships widgets?" (2-hop) where vector search fails since no single chunk contains both entities. Vector is overkill for "What is the return policy?" — one chunk suffices, embedding adds latency.
+4. **Graph vs vector.** KG trả lời "Kho nào gửi widget?" (2-hop) trong khi vector search thất bại vì không chunk nào chứa cả hai thực thể. Vector là thừa cho "Chính sách đổi trả widget?" — một chunk là đủ, embedding chỉ thêm độ trễ.

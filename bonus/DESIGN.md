@@ -1,106 +1,106 @@
-# Bonus Design: Flywheel for Vietnamese E-Commerce CSKH Chatbot
+# Bonus Design: Flywheel cho Chatbot CSKH Thương Mại Điện Tử Việt Nam
 
-## Problem & Constraints
+## Bài toán & Ràng buộc
 
-A mid-size Vietnamese e-commerce platform (200K orders/month, 15K daily chat conversations) wants to build an **agent-data flywheel** for its customer-service chatbot. The chatbot currently runs on a static FAQ + retrieval pipeline with ~72% first-contact resolution. The goal: use production traces to generate eval sets and preference data for fine-tuning, improving the bot monthly.
+Một nền tảng thương mại điện tử cỡ vừa tại Việt Nam (200K đơn hàng/tháng, 15K hội thoại chat mỗi ngày) muốn xây dựng một **flywheel dữ liệu agent** cho chatbot chăm sóc khách hàng. Chatbot hiện tại chạy trên FAQ tĩnh kết hợp retrieval pipeline với tỷ lệ giải quyết ngay lần đầu ~72%. Mục tiêu: dùng trace sản xuất để sinh eval set và dữ liệu preference cho fine-tuning, cải thiện bot hàng tháng.
 
-**Real constraints:**
-- **Language:** Vietnamese (full diacritics, regional variants like "gadget" vs "đồ điện tử", code-switching English/Vietnamese)
-- **Data volume:** ~500 conversations/day × 30 days = 15K traces/month, each with 3-8 spans
-- **Compliance:** PDPL (Law 91/2025) requires explicit consent for using customer conversation data to train models; users can opt out and request deletion
-- **Cost:** No dedicated ML infra team; one data engineer shared across products
-- **Existing stack:** PostgreSQL order DB, Elasticsearch for product search, chatbot logs in JSON Lines on S3-compatible object storage
-
----
-
-## 1. Source & Shape — Data Drift Is the Silent Killer
-
-**Decision:** Schema-on-read with a **contract version** field in every trace, validated by Pandera (same pattern as lab §3).
-
-**Why:** Chatbot traces evolve as the product team adds new intents ("return gadget" vs "cancel order"). A fixed Avro/Protobuf schema would break deployments. Instead, each trace carries `schema_version: "v2"` and a set of optional `attributes.*` fields. Pandera validates a *minimum* required set; extra fields are preserved but flagged.
-
-**Tradeoff:** Schema-on-read shifts breakage detection from compile-time to runtime. A dashboard alert (`pipeline.monitor.quarantine_spike`) triggers when >5% of daily traces fail validation. The alternative — Avro with compatibility modes — was rejected because it requires a schema registry and adds latency to trace ingestion (the chatbot team deploys 3× weekly; registry updates couldn't keep up).
-
-**Rejected alternative:** Storing traces as raw JSON in a MongoDB collection. Reason: without a typed layer, downstream consumers (eval set builder, DPO miner) would each implement parsing differently, causing silent inconsistencies. The Bronze → typed Silver pattern from the lab proved necessary here too.
+**Ràng buộc thực tế:**
+- **Ngôn ngữ:** Tiếng Việt (dấu đầy đủ, biến thể vùng miền như "gadget" vs "đồ điện tử", pha trộn Anh-Việt)
+- **Khối lượng dữ liệu:** ~500 hội thoại/ngày × 30 ngày = 15K traces/tháng, mỗi trace 3-8 spans
+- **Tuân thủ:** PDPL (Luật 91/2025) yêu cầu đồng ý rõ ràng trước khi dùng dữ liệu hội thoại khách hàng để train model; người dùng có thể từ chối và yêu cầu xóa
+- **Chi phí:** Không có đội ML infra riêng; một kỹ sư dữ liệu dùng chung cho nhiều sản phẩm
+- **Hạ tầng hiện tại:** PostgreSQL order DB, Elasticsearch cho tìm kiếm sản phẩm, log chatbot dạng JSON Lines trên object storage tương thích S3
 
 ---
 
-## 2. Batch vs Streaming — Nightly Batch Wins (For Now)
+## 1. Nguồn & Hình dạng — Data Drift là Kẻ Giết Người Thầm Lặng
 
-**Decision:** Daily batch. Traces land in object storage every hour (micro-batch), but the full flywheel (flatten → eval set → DPO pairs → PIT features) runs once at 02:00.
+**Quyết định:** Schema-on-read với trường **contract version** trong mỗi trace, xác thực bằng Pandera (giống pattern lab §3).
 
-**Why:** The chatbot doesn't need same-day fine-tuning. A 24-hour window allows human reviewers to label ambiguous turns (see §5) and lets the PDPL consent check run: traces from users who opted out in the last 24h are excluded before the flywheel starts.
+**Lý do:** Trace chatbot tiến hóa khi đội sản phẩm thêm intent mới ("trả gadget" vs "hủy đơn"). Schema Avro/Protobuf cố định sẽ làm hỏng triển khai. Thay vào đó, mỗi trace mang `schema_version: "v2"` và tập trường `attributes.*` tùy chọn. Pandera xác thực *tối thiểu* bắt buộc; trường thừa được giữ nguyên nhưng đánh dấu.
 
-**When this breaks:** At 5× volume (~75K conversations/day), the hourly micro-batch will still be fine, but the flywheel DAG may exceed the 4-hour SLA. Mitigation: incremental processing with watermark (only process traces newer than last successful run's watermark).
+**Đánh đổi:** Schema-on-read chuyển phát hiện lỗi từ compile-time sang runtime. Dashboard cảnh báo (`pipeline.monitor.quarantine_spike`) kích hoạt khi >5% trace hàng ngày fails validation. Phương án thay thế — Avro với compatibility modes — bị loại vì cần schema registry và thêm độ trễ vào trace ingestion (đội chatbot deploy 3 lần/tuần; registry updates không theo kịp).
 
-**Rejected alternative:** Redpanda/Kafka streaming (like the Docker bonus). Rejected because the team has no Kafka ops expertise; object storage + a cron DAG is debuggable by a single engineer. Latency of 24h is acceptable for the use case.
-
----
-
-## 3. Quality & Contract — Three Gates Before Data Touches a Model
-
-**Decision:** Three gates, each with separate quarantine:
-
-1. **Schema gate** (Pandera, same as lab): valid trace structure? Missing `span_id`, `parent_id`, `status`? → quarantine.
-2. **Consent gate** (custom): does the user have a valid PDPL consent record in PostgreSQL at trace time? → discard, no quarantine (data that shouldn't exist).
-3. **Semantic gate** (LLM-as-a-judge, lightweight): for error traces, is the `output` actually wrong? Some "error" traces contain correct answers but are mislabeled due to a tool bug. A cheap model (Gemini 2.0 Flash, $0.15/1M tok) scores these; low-confidence ones go to human review queue.
-
-**Tradeoff:** The LLM-as-a-judge gate adds latency (~3s per trace) and cost (~$2.25/day for 15K traces). But without it, we'd train on false-error pairs (e.g., correct answers labeled "ToolError"), poisoning the DPO dataset. The human review queue is the bottleneck: it caps throughput at ~200 traces/day. We accept this for the first 3 months and plan to replace it with a learned classifier trained on reviewed judgments.
-
-**Rejected alternative:** Use only exact-rule gates (schema + consent). This would let through ~8% of false-error traces (measured in a pilot), making the DPO pairs ~8% garbage — enough to degrade fine-tune quality silently.
+**Phương án bị loại:** Lưu trace dưới dạng JSON thô trong MongoDB. Lý do: không có lớp typed, các consumer downstream (eval set builder, DPO miner) tự implement parsing khác nhau, gây mâu thuẫn thầm lặng. Pattern Bronze → typed Silver từ lab tỏ ra cần thiết ở đây.
 
 ---
 
-## 4. Train/Serve Parity — Two Leaks to Watch
+## 2. Batch hay Streaming — Batch Hàng Đêm Thắng (Hiện Tại)
 
-**Decision:** Three levers for point-in-time correctness:
+**Quyết định:** Batch hàng ngày. Trace đổ vào object storage mỗi giờ (micro-batch), nhưng flywheel đầy đủ (flatten → eval set → DPO pairs → PIT features) chạy một lần lúc 02:00.
 
-1. **Feature store with `ASOF` semantics** (DuckDB in dev, plan to migrate to Redis+Postgres for prod): features are materialized with `valid_from`/`valid_to` timestamps; joins use `ASOF` (lab §11).
-2. **Feature logging at inference time:** each chatbot response logs the exact feature vector used. During training, we join on `(user_id, event_id)` rather than recomputing features — eliminating recency bias.
-3. **Backtest with cutoff dates:** before any training run, we simulate "what did the features look like at time T?" for 10 random cutoff dates. If the `ASOF` result differs from the logged features by >1%, alert.
+**Lý do:** Chatbot không cần fine-tuning cùng ngày. Cửa sổ 24h cho phép người đánh giá gán nhãn các turn mơ hồ (xem §5) và để kiểm tra đồng ý PDPL: trace từ user đã từ chối trong 24h qua bị loại trước khi flywheel khởi động.
 
-**Known leak #1:** `user_total_orders` computed with a `GROUP BY` without a timestamp filter. Fixed by making it `SUM(orders) WHERE event_ts <= current_event_ts`.
+**Khi nào hỏng:** Ở 5× khối lượng (~75K hội thoại/ngày), micro-batch hàng giờ vẫn ổn, nhưng DAG flywheel có thể vượt quá SLA 4h. Giảm nhẹ: xử lý tăng dần với watermark (chỉ xử lý trace mới hơn lần chạy thành công cuối cùng).
 
-**Known leak #2:** Product embeddings updated daily; a conversation at 09:00 might use today's embedding that was computed at 02:00. This is a *temporal misalignment* but not a leak (the embedding is timestamped). Documented and accepted.
-
-**Rejected alternative:** Recompute all features from scratch for each training dataset (like a fully deterministic backfill). Rejected because it makes iterative feature engineering prohibitively slow (15K traces × 20 features × 10 iterations = 3M recomputes).
+**Phương án bị loại:** Streaming Redpanda/Kafka (như Docker bonus). Loại vì team không có chuyên môn vận hành Kafka; object storage + cron DAG có thể debug bởi một kỹ sư duy nhất. Độ trễ 24h chấp nhận được cho use case này.
 
 ---
 
-## 5. Decontamination — Vietnamese Adds a Twist
+## 3. Chất lượng & Hợp đồng — Ba Cổng Trước Khi Dữ Liệu Chạm Model
 
-**Decision:** Two-level decontamination: exact-match (like the lab) + **fuzzy n-gram** (character 13-grams, Jaccard similarity ≥0.85).
+**Quyết định:** Ba cổng, mỗi cổng có quarantine riêng:
 
-**Why:** Vietnamese prompts are often paraphrased. "Có thể trả lại widget đã mua 10 ngày trước không?" and "Widget mua 10 ngày trước có trả lại được không?" contain zero identical words but are semantically identical. Exact-match decontamination would miss them, silently leaking eval prompts into training.
+1. **Cổng Schema** (Pandera, giống lab): cấu trúc trace hợp lệ? Thiếu `span_id`, `parent_id`, `status`? → quarantine.
+2. **Cổng Đồng ý** (custom): user có bản ghi đồng ý PDPL hợp lệ trong PostgreSQL tại thời điểm trace không? → loại bỏ, không quarantine (dữ liệu không nên tồn tại).
+3. **Cổng Ngữ nghĩa** (LLM-as-a-judge, nhẹ): với error traces, `output` có thực sự sai không? Một số trace "error" chứa câu trả lời đúng nhưng bị gán nhãn sai do lỗi tool. Model rẻ (Gemini 2.0 Flash, $0.15/1M tok) chấm điểm; các điểm thấp vào hàng đợi đánh giá thủ công.
 
-**Vietnamese-specific challenge:** Vietnamese word segmentation (e.g., "trả_lại" vs "trả lại") creates noise in n-gram matching. Solution: normalize by removing spaces within known compound words using pyvi tokenizer before building n-grams.
+**Đánh đổi:** Cổng LLM-as-a-judge thêm độ trễ (~3s/trace) và chi phí (~$2.25/ngày cho 15K traces). Nhưng không có nó, chúng ta train trên cặp false-error (vd: câu trả lời đúng bị gán nhãn "ToolError"), đầu độc dataset DPO. Hàng đợi đánh giá thủ công là bottleneck: giới hạn throughput ~200 traces/ngày. Chấp nhận trong 3 tháng đầu và lên kế hoạch thay thế bằng classifier học từ các đánh giá đã tích lũy.
 
-**Cost:** Character 13-gram decontamination on 15K traces takes ~4 minutes. The accepted tradeoff: we might over-decontaminate (drop a genuinely novel prompt that happens to share n-grams with an eval prompt). Monitoring: track the "false positive rate" by having a human label a random 1% sample of dropped pairs quarterly.
-
-**Rejected alternative:** Embedding-based decontamination (reuse `embed.py` from lab). Rejected because embeddings are sensitive to the embedding model's training data; a model fine-tuned on customer-service data might embed similar prompts close together even if they ask different things, causing over-decontamination.
+**Phương án bị loại:** Chỉ dùng cổng rule chính xác (schema + đồng ý). Điều này để lọt ~8% trace false-error (đo trong pilot), làm dataset DPO ~8% rác — đủ để giảm chất lượng fine-tune một cách thầm lặng.
 
 ---
 
-## Architecture Sketch
+## 4. Train/Serve Parity — Hai Rò Rỉ Cần Theo Dõi
+
+**Quyết định:** Ba đòn bẩy cho tính chính xác point-in-time:
+
+1. **Feature store với ngữ nghĩa `ASOF`** (DuckDB trong dev, lên kế hoạch migrate lên Redis+Postgres cho prod): features được vật chất hóa với timestamp `valid_from`/`valid_to`; joins dùng `ASOF` (lab §11).
+2. **Logging feature tại thời điểm inference:** mỗi response chatbot ghi lại feature vector chính xác đã dùng. Trong training, chúng ta join trên `(user_id, event_id)` thay vì tính lại features — loại bỏ recency bias.
+3. **Backtest với cutoff dates:** trước mỗi lần chạy training, mô phỏng "features trông thế nào tại thời điểm T?" cho 10 cutoff dates ngẫu nhiên. Nếu kết quả `ASOF` khác với logged features >1%, cảnh báo.
+
+**Rò rỉ #1:** `user_total_orders` tính bằng `GROUP BY` không có bộ lọc timestamp. Sửa: đổi thành `SUM(orders) WHERE event_ts <= current_event_ts`.
+
+**Rò rỉ #2:** Product embeddings cập nhật hàng ngày; hội thoại lúc 09:00 có thể dùng embedding hôm nay được tính lúc 02:00. Đây là *lệch thời gian* nhưng không phải rò rỉ (embedding có timestamp). Đã ghi nhận và chấp nhận.
+
+**Phương án bị loại:** Tính lại tất cả features từ đầu cho mỗi training dataset (như backfill hoàn toàn xác định). Loại vì làm cho iterative feature engineering chậm không chấp nhận được (15K traces × 20 features × 10 iterations = 3M tính toán lại).
+
+---
+
+## 5. Decontamination — Tiếng Việt Thêm Phần Phức Tạp
+
+**Quyết định:** Decontamination hai cấp: khớp chính xác (giống lab) + **fuzzy n-gram** (character 13-grams, Jaccard similarity ≥0.85).
+
+**Lý do:** Prompt tiếng Việt thường được diễn đạt lại. "Có thể trả lại widget đã mua 10 ngày trước không?" và "Widget mua 10 ngày trước có trả lại được không?" không chứa từ nào giống hệt nhau nhưng đồng nghĩa. Decontamination khớp chính xác sẽ bỏ lỡ, âm thầm rò rỉ eval prompts vào training.
+
+**Thách thức đặc thù tiếng Việt:** Phân đoạn từ tiếng Việt (vd: "trả_lại" vs "trả lại") tạo nhiễu trong n-gram matching. Giải pháp: chuẩn hóa bằng cách loại bỏ khoảng trắng trong các từ ghép đã biết dùng pyvi tokenizer trước khi xây dựng n-grams.
+
+**Chi phí:** Character 13-gram decontamination trên 15K traces mất ~4 phút. Đánh đổi chấp nhận: có thể decontaminate quá mức (drop một prompt thực sự mới tình cờ chia sẻ n-grams với eval prompt). Giám sát: theo dõi "false positive rate" bằng cách cho người đánh giá nhãn mẫu ngẫu nhiên 1% số cặp bị drop hàng quý.
+
+**Phương án bị loại:** Embedding-based decontamination (dùng lại `embed.py` từ lab). Loại vì embeddings nhạy với dữ liệu huấn luyện của embedding model; một model fine-tuned trên dữ liệu CSKH có thể nhúng các prompts tương tự gần nhau dù chúng hỏi khác nhau, gây over-decontamination.
+
+---
+
+## Sơ đồ Kiến trúc
 
 ```
-                          ┌──────────────────────┐
-                          │  Chatbot Trace Logs   │
-                          │ (JSON Lines, S3)      │
-                          └──────────┬───────────┘
+                          ┌──────────────────────────┐
+                          │  Log Chatbot Trace       │
+                          │ (JSON Lines, S3)         │
+                          └──────────┬───────────────┘
                                      │
                                      ▼
-                          ┌──────────────────────┐
-                          │  Bronze (raw, typed)  │
-                          │  DuckDB :memory:      │  ← schema gate
-                          └──────────┬───────────┘
+                          ┌──────────────────────────┐
+                          │  Bronze (raw, typed)     │
+                          │  DuckDB :memory:         │  ← cổng Schema
+                          └──────────┬───────────────┘
                                      │
-                   ┌─────────────────┼─────────────────┐
-                   ▼                 ▼                  ▼
-          ┌──────────────┐  ┌──────────────┐  ┌──────────────┐
-          │ Consent Gate  │  │ Flatten spans │  │ Semantic Gate │
-          │ (PostgreSQL)  │  │ → Bronze_flat │  │ (LLM judge)   │
-          └──────┬───────┘  └──────┬───────┘  └──────┬───────┘
+                   ┌─────────────────┼────────────────────┐
+                   ▼                 ▼                    ▼
+          ┌──────────────┐  ┌──────────────┐  ┌─────────────────┐
+          │ Cổng Đồng ý  │  │ Flatten spans │  │ Cổng Ngữ nghĩa  │
+          │ (PostgreSQL)  │  │ → Bronze_flat │  │ (LLM judge)     │
+          └──────┬───────┘  └──────┬───────┘  └──────┬──────────┘
                  │                 │                  │
                  ▼                 ▼                  ▼
           ┌──────────────────────────────────────────────┐
@@ -117,30 +117,30 @@ A mid-size Vietnamese e-commerce platform (200K orders/month, 15K daily chat con
          │                 │                  │
          └─────────────────┼──────────────────┘
                            ▼
-                  ┌────────────────┐
-                  │ Decontaminate  │
+                  ┌──────────────────┐
+                  │ Decontaminate    │
                   │ (exact + 13-gram)│
-                  └───────┬────────┘
+                  └───────┬──────────┘
                           ▼
-                  ┌────────────────┐
-                  │ Train Dataset  │ → Day 22 SFT/DPO
-                  └────────────────┘
+                  ┌──────────────────┐
+                  │ Train Dataset    │ → Day 22 SFT/DPO
+                  └──────────────────┘
 ```
 
 ---
 
-## Cost & Vietnam Context
+## Chi phí & Bối cảnh Việt Nam
 
-**Monthly cost estimate at 15K traces:**
-- Object storage: ~$3 (200MB/month)
+**Ước tính chi phí hàng tháng tại 15K traces:**
+- Object storage: ~$3 (200MB/tháng)
 - Compute (EC2 t3.medium, reserved): ~$25
 - LLM judge API: ~$70 (Gemini Flash)
-- Human review (part-time): ~$200
-- **Total: ~$300/month**
+- Đánh giá thủ công (bán thời gian): ~$200
+- **Tổng: ~$300/tháng**
 
-**80% cost:** LLM judge + human review. To cut, we could replace the LLM judge with a fine-tuned PhoBERT classifier after we accumulate 3 months of reviewed data. But that's a classic bootstrap problem — you need the judge to generate the data to replace the judge.
+**80% chi phí:** LLM judge + đánh giá thủ công. Để cắt giảm, có thể thay LLM judge bằng PhoBERT classifier fine-tuned sau khi tích lũy 3 tháng dữ liệu đã đánh giá. Nhưng đây là bài toán bootstrap kinh điển — bạn cần judge để sinh dữ liệu thay thế judge.
 
-**Vietnam-specific decisions:**
-- PDPL compliance required a consent gate *before* any data touches the training pipeline, not after. This is reversed from US/EU patterns where consent is checked at serving time.
-- Object storage is S3-compatible (Viettel Cloud / VNG Cloud) rather than AWS S3 — same API, but egress costs are 2× higher ($0.09/GB vs $0.05/GB). We minimize egress by running the flywheel inside the same cloud region.
-- The human reviewer must be Vietnamese-speaking, adding hiring constraints. We budget for a part-time contractor rather than a full FTE.
+**Quyết định đặc thù Việt Nam:**
+- Tuân thủ PDPL yêu cầu cổng đồng ý *trước khi* dữ liệu chạm pipeline training, không phải sau. Điều này ngược với pattern US/EU nơi consent được kiểm tra tại serving time.
+- Object storage là S3-compatible (Viettel Cloud / VNG Cloud) thay vì AWS S3 — cùng API, nhưng chi phí egress cao gấp 2 ($0.09/GB vs $0.05/GB). Chúng tôi giảm thiểu egress bằng cách chạy flywheel trong cùng region cloud.
+- Người đánh giá thủ công phải nói tiếng Việt, thêm ràng buộc tuyển dụng. Chúng tôi dự trù nhà thầu bán thời gian thay vì nhân viên chính thức.
